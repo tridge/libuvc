@@ -38,6 +38,11 @@
 #include "libuvc/libuvc.h"
 #include "libuvc/libuvc_internal.h"
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 uvc_frame_desc_t *uvc_find_frame_desc_stream(uvc_stream_handle_t *strmh,
     uint16_t format_id, uint16_t frame_id);
 uvc_frame_desc_t *uvc_find_frame_desc(uvc_device_handle_t *devh,
@@ -143,6 +148,7 @@ uvc_error_t uvc_query_stream_ctrl(
   uint8_t buf[34];
   size_t len;
   uvc_error_t err;
+  uvc_frame_desc_t *frame;
 
   bzero(buf, sizeof(buf));
 
@@ -166,8 +172,17 @@ uvc_error_t uvc_query_stream_ctrl(
     INT_TO_DW(ctrl->dwMaxPayloadTransferSize, buf + 22);
 
     if (len == 34) {
-      /** @todo support UVC 1.1 */
-      return UVC_ERROR_NOT_SUPPORTED;
+        /*
+          newer cameras can use a larger control block with more
+          fields. It doesn't look like any of these are essential,
+          but they are initialised to zero here, and the names given
+          for future reference
+        */
+        INT_TO_DW(0, buf + 26); // dwClockFrequency
+        buf[30] = 0; // bmFramingInfo
+        buf[31] = 0; // bPreferedVersion
+        buf[32] = 0; // bMinVersion
+        buf[33] = 0; // bMaxVersion
     }
   }
 
@@ -200,17 +215,13 @@ uvc_error_t uvc_query_stream_ctrl(
     ctrl->dwMaxPayloadTransferSize = DW_TO_INT(buf + 22);
 
     if (len == 34) {
-      /** @todo support UVC 1.1 */
-      return UVC_ERROR_NOT_SUPPORTED;
+        // we ignore the extra parameters. See above comments for what
+        // the fields are
     }
 
-    /* fix up block for cameras that fail to set dwMax* */
-    if (ctrl->dwMaxVideoFrameSize == 0) {
-      uvc_frame_desc_t *frame = uvc_find_frame_desc(devh, ctrl->bFormatIndex, ctrl->bFrameIndex);
-
-      if (frame) {
+    uvc_frame_desc_t *frame = uvc_find_frame_desc(devh, ctrl->bFormatIndex, ctrl->bFrameIndex);
+    if (ctrl->dwMaxVideoFrameSize > frame->dwMaxVideoFrameBufferSize) {
         ctrl->dwMaxVideoFrameSize = frame->dwMaxVideoFrameBufferSize;
-      }
     }
   }
 
@@ -311,7 +322,6 @@ uvc_error_t uvc_get_stream_ctrl_format_size(
     int width, int height,
     int fps) {
   uvc_streaming_interface_t *stream_if;
-  enum uvc_vs_desc_subtype format_class;
 
   /* get the max values */
   uvc_query_stream_ctrl(
@@ -336,7 +346,8 @@ uvc_error_t uvc_get_stream_ctrl_format_size(
 
         if (frame->intervals) {
           for (interval = frame->intervals; *interval; ++interval) {
-            if (10000000 / *interval == (unsigned int) fps) {
+            // allow a fps rate of zero to mean "accept first rate available"
+            if (10000000 / *interval == (unsigned int) fps || fps == 0) {
               ctrl->bmHint = (1 << 0); /* don't negotiate interval */
               ctrl->bFormatIndex = format->bFormatIndex;
               ctrl->bFrameIndex = frame->bFrameIndex;
@@ -367,6 +378,7 @@ uvc_error_t uvc_get_stream_ctrl_format_size(
     }
   }
 
+  printf("%s(%u)\n", __FUNCTION__, (unsigned)__LINE__);
   return UVC_ERROR_INVALID_MODE;
 
 found:
@@ -439,7 +451,6 @@ void _uvc_iso_callback(struct libusb_transfer *transfer) {
   uint8_t *pktbuf;
   uint8_t check_header;
   size_t header_len;
-  size_t data_len;
   struct libusb_iso_packet_descriptor *pkt;
 
   static uint8_t isight_tag[] = {
@@ -558,6 +569,80 @@ void _uvc_iso_callback(struct libusb_transfer *transfer) {
   
   if (strmh->running)
     libusb_submit_transfer(transfer);
+}
+
+/** @internal
+ * @brief bulk transfer callback
+ * 
+ * Processes stream, places frames into buffer, signals listeners
+ * (such as user callback thread and any polling thread) on new frame
+ *
+ * @param transfer Active transfer
+ */ 
+void _uvc_bulk_callback(struct libusb_transfer *transfer) {
+#if 1
+    printf("status=%u actual_length=%u length=%u\n", 
+           (unsigned)transfer->status,
+           (unsigned)transfer->actual_length,
+           (unsigned)transfer->length);
+#endif
+
+  uvc_stream_handle_t *strmh;
+  strmh = transfer->user_data;
+  uint32_t data_len = transfer->actual_length;
+  const uint8_t *b = transfer->buffer;
+  uint8_t header_size;
+  uint8_t payload_header_info = 0;
+
+  switch (transfer->status) {
+  case LIBUSB_TRANSFER_COMPLETED:
+#if 1
+      printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x len=%u\n", 
+             b[0], b[1], b[2], b[3], 
+             b[4], b[5], b[6], b[7], 
+             b[8], b[9], b[10], b[11], 
+             data_len);
+#endif
+      if (strmh->bulk_new_frame) {
+          // we're at the start of a payload
+          header_size = b[0];
+          payload_header_info = b[1];
+      } else {
+          header_size = 0;
+      }
+      if (header_size > data_len) {
+          printf("Invalid payload header_size=%u\n", (unsigned)header_size);
+          return;
+      }
+
+      memcpy(strmh->outbuf + strmh->got_bytes, 
+             transfer->buffer+header_size, 
+             data_len-header_size);
+      strmh->got_bytes += data_len - header_size;
+      if (transfer->actual_length < transfer->length) {
+          strmh->bulk_new_frame = true;
+      } else {
+          strmh->bulk_new_frame = false;          
+      }
+
+#if 1
+      printf("got_bytes=%u hlen=%u bulk_new_frame=%u\n", 
+             (unsigned)strmh->got_bytes, header_size,
+             (unsigned)strmh->bulk_new_frame);
+#endif
+      
+      if (data_len == 0 || (payload_header_info & UVC_STREAM_EOF) || 
+          strmh->got_bytes >= strmh->cur_ctrl.dwMaxVideoFrameSize) {
+          _uvc_swap_buffers(strmh);
+          strmh->bulk_new_frame = true;
+      }
+      int ret = libusb_submit_transfer(transfer);
+      if (ret != UVC_SUCCESS) {
+          UVC_DEBUG("libusb_submit_transfer failed");
+          break;
+      }
+      break;
+  }
 }
 
 /** Begin streaming video from the camera into the callback function.
@@ -682,8 +767,8 @@ uvc_error_t uvc_stream_open_ctrl(uvc_device_handle_t *devh, uvc_stream_handle_t 
 
   // Set up the streaming status and data space
   strmh->running = 0;
-  strmh->outbuf = malloc(8 * 1024 * 1024); /** @todo take only what we need */
-  strmh->holdbuf = malloc(8 * 1024 * 1024);
+  strmh->outbuf = malloc(16 * 1024 * 1024); /** @todo take only what we need */
+  strmh->holdbuf = malloc(16 * 1024 * 1024);
    
   pthread_mutex_init(&strmh->cb_mutex, NULL);
   pthread_cond_init(&strmh->cb_cond, NULL);
@@ -820,8 +905,9 @@ uvc_error_t uvc_stream_start(
 
     /* If we searched through all the altsettings and found nothing usable */
     if (alt_idx == interface->num_altsetting) {
-      ret = UVC_ERROR_INVALID_MODE;
-      goto fail;
+        printf("%s(%u)\n", __FUNCTION__, (unsigned)__LINE__);
+        ret = UVC_ERROR_INVALID_MODE;
+        goto fail;
     }
 
     /* Select the altsetting */
@@ -845,9 +931,55 @@ uvc_error_t uvc_stream_start(
         total_transfer_size, packets_per_transfer, _uvc_iso_callback, (void*) strmh, 5000);
 
       libusb_set_iso_packet_lengths(transfer, endpoint_bytes_per_packet);
+      printf("setup transfer total_transfer_size=%u\n", (unsigned)total_transfer_size);
     }
   } else {
     /** @todo prepare for bulk transfer */
+      printf("prepare bulk transfer\n");
+      const struct libusb_interface_descriptor *altsetting;
+      const struct libusb_endpoint_descriptor *endpoint;
+      /* Total amount of data per transfer */
+      size_t total_transfer_size = ctrl->dwMaxVideoFrameSize;
+      /* Size of packet transferable from the chosen endpoint */
+      size_t endpoint_bytes_per_packet;
+      /* Index of the altsetting */
+      int ep_idx;
+    
+      struct libusb_transfer *transfer;
+      int transfer_id;
+
+      altsetting = interface->altsetting; // only 1 altsetting for bulk
+      endpoint_bytes_per_packet = 0;
+
+      /* Find the endpoint with the number specified in the VS header */
+      for (ep_idx = 0; ep_idx < altsetting->bNumEndpoints; ep_idx++) {
+        endpoint = altsetting->endpoint + ep_idx;
+
+        if (endpoint->bEndpointAddress == format_desc->parent->bEndpointAddress) {
+          endpoint_bytes_per_packet = endpoint->wMaxPacketSize;
+          // wMaxPacketSize: [unused:2 (multiplier-1):3 size:11]
+          endpoint_bytes_per_packet = (endpoint_bytes_per_packet & 0x07ff) *
+                                      (((endpoint_bytes_per_packet >> 11) & 3) + 1);
+          break;
+        }
+      }
+
+      /* Set up the transfers */
+      for (transfer_id = 0; transfer_id < ARRAYSIZE(strmh->transfers); ++transfer_id) {
+          const uint32_t chunk_size = endpoint_bytes_per_packet*2;
+          transfer = libusb_alloc_transfer(0);
+          strmh->transfers[transfer_id] = transfer;      
+          strmh->transfer_bufs[transfer_id] = malloc(chunk_size);
+          
+          libusb_fill_bulk_transfer(
+              transfer, strmh->devh->usb_devh, format_desc->parent->bEndpointAddress,
+              strmh->transfer_bufs[transfer_id],
+              chunk_size, _uvc_bulk_callback, (void*) strmh, 50000);
+          
+          printf("setup bulk transfer total_transfer_size=%u\n", (unsigned)total_transfer_size);
+      }
+
+      strmh->bulk_new_frame = true;
   }
 
   strmh->user_cb = cb;
@@ -860,18 +992,14 @@ uvc_error_t uvc_stream_start(
     pthread_create(&strmh->cb_thread, NULL, _uvc_user_caller, (void*) strmh);
   }
 
-  if (isochronous) {
-    int transfer_id;
+  int transfer_id;
 
-    for (transfer_id = 0; transfer_id < ARRAYSIZE(strmh->transfers); transfer_id++) {
+  for (transfer_id = 0; transfer_id < ARRAYSIZE(strmh->transfers); transfer_id++) {
       ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
       if (ret != UVC_SUCCESS) {
-        UVC_DEBUG("libusb_submit_transfer failed");
-        break;
+          UVC_DEBUG("libusb_submit_transfer failed");
+          break;
       }
-    }
-  } else {
-    /** @todo submit bulk transfer */
   }
 
   if (ret != UVC_SUCCESS) {
